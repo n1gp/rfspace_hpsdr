@@ -1,6 +1,6 @@
 /* Copyright (C)
 *   10/2025 - Rick Koch, N1GP
-*   Wrote rfspace_usb2hpsdr using various open sources on the internet.
+*   Wrote rfspace_hpsdr using various open sources on the internet.
 *     https://github.com/kgarrels/SoapySDR14
 *     Ian (G7GHH), sdr-14 code examples
 *     Christoph, https://github.com/dl1ycf/pihpsdr
@@ -25,7 +25,7 @@
  * an RFSPACE SDR-14 or SDR-IQ radio.
  */
 
-#include "rfspace_usb2hpsdr.h"
+#include "rfspace_hpsdr.h"
 
 // Defines for some of the AD6620 registers
 #define ADR_CIC2SCALE 0x305     //8 bits, range 0 to 6 each count==6dB atten
@@ -38,14 +38,17 @@
 #define ADR_TAPS 0x30C          //8 bits 0 to 255(number of RCF taps 1 to 256)
 #define ADR_RESERVED 0x30D      //must be zero
 
-struct ftdi_context *ftdi;
+struct ftdi_context *ftdi = NULL;
 char serialNumber[64] = {0};
 int fd;
 unsigned char broadcastReply[60];
 int active = 0;
+int _udp, _tcp;
 uint32_t last_sequence_number = 0;
 uint32_t last_seqnum = 0, seqnum;
-float complex iqBuffer[((RTL_READ_COUNT / 2) + (IQ_FRAME_DATA_LEN * 2))];
+unsigned int vid = 0, pid = 0;
+int (*math_operation)(int, int);
+float complex iqBuffer[((SDR_READ_COUNT / 2) + (IQ_FRAME_DATA_LEN * 2))];
 
 static int num_copy_rcvrs = 0, do_exit = 0;
 static int copy_rcvr[8];
@@ -75,7 +78,9 @@ static void *handler_ep6(void *arg);
 static int oldnew = 1;  // 1: only P1, 2: only P2, 3: P1 and P2,
 static int active_thread = 0;
 static int enable_thread = 0;
-static bool _run_usb_read_task;
+static bool _run_usb_read_task = false;
+static bool _run_tcp_keepalive_task = false;
+static bool _run_udp_read_task = false;
 
 struct main_cb mcb;
 
@@ -90,6 +95,8 @@ static pthread_cond_t done_send_cond = PTHREAD_COND_INITIALIZER;
 
 static pthread_t hpsdrsim_sendiq_thr[MAX_RCVRS];
 static pthread_t usb_read_task;
+static pthread_t tcp_keepalive_task;
+static pthread_t udp_read_task;
 
 static int nsamps_packet[8] = { 126, 72, 50, 38, 30, 26, 22, 20 };
 static int frame_offset1[8] = { 520, 520, 516, 510, 496, 510, 500, 516 };
@@ -100,8 +107,21 @@ static int running = 0;
 static u_char buffer[MAX_BUFFER_LEN];
 static u_char payload[HPSDR_FRAME_LEN];
 
-static struct sockaddr_in addr_new;
+struct sockaddr_in addr_new;
 static struct sockaddr_in addr_old;
+
+// PROTO2 =======
+static int run = 0;
+
+int new_protocol_running() {
+  if (run) { return 1; } 
+  else { return 0; } 
+}
+
+void new_protocol_general_packet(unsigned char *buffer) {
+  // STUB
+}
+// ==============
 
 // using clock_nanosleep of librt
 extern int clock_nanosleep(clockid_t __clock_id, int __flags,
@@ -121,29 +141,57 @@ uint64_t get_posix_clock_time_us()
 bool transaction( const unsigned char *cmd, size_t size, unsigned char *response )
 {
     size_t rx_bytes = 0;
+    unsigned char data[1024*2];
     int ret=0;
 
     memset(response, 0, 64);
 
-    if ( (ret = ftdi_write_data(ftdi, cmd, size))  ) {
-        if (ret != (int)size) return false;
+    if (ftdi != NULL) {
+        if ( (ret = ftdi_write_data(ftdi, cmd, size))  ) {
+            if (ret != (int)size)
+                return false;
+        }
+        pthread_mutex_lock (&resp_lock);
+        pthread_cond_wait (&resp_cond, &resp_lock);
+        rx_bytes = resp_size;
+        memcpy( response, resp_data, rx_bytes );
+    } else {
+        if ( send(_tcp, cmd, size, 0) != (int)size )
+            goto OUTBAD;
+
+        pthread_mutex_lock (&resp_lock);
+
+        int nbytes = read(_tcp, data, 2); // read header
+        if ( nbytes != 2 )
+            goto OUTBAD;
+
+        int length = (data[1] & 0x1f) | data[0];
+
+        if ( (length < 2) || (length > (int)sizeof(data)) )
+            goto OUTBAD;
+
+        length -= 2; // subtract header size
+
+        nbytes = read(_tcp, &data[2], length); // read payload
+        if ( nbytes != length )
+            goto OUTBAD;
+
+        rx_bytes = 2 + length; // header + payload
+        memcpy( response, data, rx_bytes );
     }
-
-    pthread_mutex_lock (&resp_lock);
-    pthread_cond_wait (&resp_cond, &resp_lock);
-
-    rx_bytes = resp_size;
-    memcpy( response, &resp_data[0], rx_bytes );
 
 #if 0
     printf("%d> ", rx_bytes);
     for (size_t i = 0; i < rx_bytes; i++)
-        printf("%02x ", (unsigned char) resp_data[i]);
+        printf("%02x ", (unsigned char) response[i]);
     printf("\n");
 #endif
-    pthread_mutex_unlock (&resp_lock);
 
+    pthread_mutex_unlock (&resp_lock);
     return true;
+OUTBAD:
+    pthread_mutex_unlock (&resp_lock);
+    return false;
 }
 
 bool resp_transaction( const unsigned char *cmd, size_t size )
@@ -200,11 +248,16 @@ bool start()
     _running = true;
     _keep_running = false;
 
-    unsigned char start[] = { 0x08, 0x00, 0x18, 0x00, 0x81, 0x02, 0x00, 0x01 };
+    unsigned char start[] = { 0x08, 0x00, 0x18, 0x00, 0x80, 0x02, 0x00, 0x00 };
 
-    // set if gain
-    unsigned char ifgain[] = { 0x06, 0x00, 0x40, 0x00, 0x00, 0x18 };
-    resp_transaction( ifgain, sizeof(ifgain) );
+    if(vid) {
+        start[sizeof(start)-4] = 0x81;
+        start[sizeof(start)-1] = 0x01;
+
+        // set if gain
+        unsigned char ifgain[] = { 0x06, 0x00, 0x40, 0x00, 0x00, 0x18 };
+        resp_transaction( ifgain, sizeof(ifgain) );
+    }
 
     return resp_transaction( start, sizeof(start) );
 }
@@ -215,11 +268,14 @@ bool stop()
         _running = false;
     _keep_running = false;
 
-    unsigned char stop[] = { 0x08, 0x00, 0x18, 0x00, 0x81, 0x01, 0x00, 0x00 };
+    unsigned char stop[] = { 0x08, 0x00, 0x18, 0x00, 0x00, 0x01, 0x00, 0x00 };
+    if(vid) {
+        stop[sizeof(stop)-4] = 0x81;
+    }
     return resp_transaction( stop, sizeof(stop) );
 }
 
-void sdr14_sighandler (int signum)
+void sdr_sighandler (int signum)
 {
     t_print ("Signal caught, exiting!\n");
     enable_thread = 0;
@@ -325,14 +381,25 @@ int SetRFGain( const double gain )
 {
     unsigned char atten[] = { 0x06, 0x00, 0x38, 0x00, 0x00, 0x00 };
 
-    if ( gain <= -20 )
-        atten[sizeof(atten)-1] = 0xE2;
-    else if ( gain <= -10 )
-        atten[sizeof(atten)-1] = 0xEC;
-    else if ( gain < 0 )
-        atten[sizeof(atten)-1] = 0xF6;
-    else // +10 dB
-        atten[sizeof(atten)-1] = 0x00;
+    if (vid) {
+        if ( gain <= -20 )
+            atten[sizeof(atten)-1] = 0xE2;
+        else if ( gain <= -10 )
+            atten[sizeof(atten)-1] = 0xEC;
+        else if ( gain < 0 )
+            atten[sizeof(atten)-1] = 0xF6;
+        else // +10 dB
+            atten[sizeof(atten)-1] = 0x00;
+    } else {
+        if ( gain <= -30 )
+            atten[sizeof(atten)-1] = 0xE2;
+        else if ( gain <= -20 )
+            atten[sizeof(atten)-1] = 0xEC;
+        else if ( gain <= -10 )
+            atten[sizeof(atten)-1] = 0xF6;
+        else // 0 dB
+            atten[sizeof(atten)-1] = 0x00;
+    }
 
     resp_transaction( atten, sizeof(atten) );
     return 1;
@@ -393,10 +460,64 @@ bool ack()
     return ftdi_write_data(ftdi, ack, 3);
 }
 
+void *tcp_keepalive_task_func (void *arg)
+{
+    unsigned char response[64];
+    unsigned char status_pkt[] = { 0x04, 0x20, 0x05, 0x00 };
+
+    if ( -1 == _tcp )
+        return NULL;
+
+    while ( _run_tcp_keepalive_task ) {
+        sleep(60);
+        transaction( status_pkt, sizeof(status_pkt), response );
+    }
+    return NULL;
+}
+
+void *udp_read_task_func (void *arg)
+{
+#define HEADER_SIZE 2
+#define SEQNUM_SIZE 2
+
+    struct sockaddr_in sa_in;           // remote address
+    socklen_t addrlen = sizeof(sa_in);  // length of addresses
+    ssize_t rx_bytes;
+    float scale = 80.0f;
+    unsigned char data[1024*2];
+
+    //t_print("Starting udp_read_task_func()\n");
+    while ( _run_udp_read_task ) {
+        rx_bytes = recvfrom(_udp, data, sizeof(data), 0, (struct sockaddr *)&sa_in, &addrlen);
+        if ( rx_bytes <= 0 ) {
+            t_print("recvfrom returned %ld rx_bytes\n", rx_bytes);
+            return NULL;
+        }
+
+        int16_t *sample = (int16_t *)(data + HEADER_SIZE + SEQNUM_SIZE);
+        size_t num_samples = (rx_bytes - HEADER_SIZE - SEQNUM_SIZE) / (sizeof(int16_t) * 2);
+
+        for ( size_t i = 0; i < num_samples; i++ ) {
+            iqBuffer[i] = ((float)*(sample+0) * scale) + (((float)*(sample+1) * scale) * _Complex_I);
+            //printf("i:%ld I:%x Q:%x ", i, *(sample+0), *(sample+1));
+            // offset to the next I+Q sample
+            sample += 2;
+        }
+
+        pthread_mutex_lock (&iqready_lock);
+        rcvr_flags |= 1;
+        //rcvr_flags |= rcb->rcvr_mask;
+        pthread_cond_broadcast (&iqready_cond);
+        pthread_mutex_unlock (&iqready_lock);
+    }
+    return NULL;
+}
+
 void *usb_read_task_func (void *arg)
 {
     unsigned char data[1024*10];
     uint64_t time_us, last_time_us;
+    float scale = 20.0f;
 
     t_print("Starting usb_read_task_func()\n");
     while ( _run_usb_read_task ) {
@@ -438,17 +559,18 @@ void *usb_read_task_func (void *arg)
             size_t num_samples = length / 4;
             //t_print("num_samples:%ld\n", num_samples);
 
-#define SCALE (20.0f)
-
             int16_t *sample = (int16_t *)(data + 2);
 
             for ( size_t i = 0; i < num_samples; i++ ) {
-                //t_print("i:%d I:%f Q:%f ", i, *(sample+0) * SCALE_16, *(sample+1) * SCALE_16 );
-                iqBuffer[i] = ((float)*(sample+0) * SCALE) + (((float)*(sample+1) * SCALE) * _Complex_I);
+                iqBuffer[i] = ((float)*(sample+0) * scale) + (((float)*(sample+1) * scale) * _Complex_I);
                 // offset to the next I+Q sample
                 sample += 2;
             }
-
+#if 0
+            for ( size_t i = num_samples; i < num_samples+13; i++ ) {
+                iqBuffer[i] = 0.0f + (0.0f * _Complex_I);
+            }
+#endif
             pthread_mutex_lock (&iqready_lock);
             rcvr_flags |= 1;
             //rcvr_flags |= rcb->rcvr_mask;
@@ -469,7 +591,7 @@ void *usb_read_task_func (void *arg)
 
 int reset_usb_device(unsigned int vendor_id, unsigned int product_id)
 {
-    FILE *fp; 
+    FILE *fp;
     char line[64];
     int rc;
 
@@ -478,7 +600,7 @@ int reset_usb_device(unsigned int vendor_id, unsigned int product_id)
     if (fp == NULL) {
         perror("Failed to run lsusb command");
         return -1;
-    }    
+    }
 
     // Read the output of lsusb line by line
     while (fgets(line, sizeof(line), fp) != NULL) {
@@ -487,21 +609,21 @@ int reset_usb_device(unsigned int vendor_id, unsigned int product_id)
 
         // Parse the line for Bus, Device, and ID
         // Expected format: "Bus 001 Device 001: ID 1d6b:0002 ..."
-        if (sscanf(line, "Bus %d Device %d: ID %x:%x", &bus, &device, &id_vendor, &id_product) == 4) { 
+        if (sscanf(line, "Bus %d Device %d: ID %x:%x", &bus, &device, &id_vendor, &id_product) == 4) {
             // Check if the IDs match the target device
             if (id_vendor == vendor_id && id_product == product_id) {
                 sprintf(line, "/dev/bus/usb/%03d/%03d", bus, device);
-                printf("Found %s\n", line);
+                t_print("Found %s\n", line);
                 pclose(fp);
                 fd = open(line, O_WRONLY);
-                if (fd < 0) { 
+                if (fd < 0) {
                     perror("Error opening output file");
                     return -1;
                 }
 
-                printf("Resetting USB device %s\n", line);
+                t_print("Resetting USB device %s\n", line);
                 rc = ioctl(fd, USBDEVFS_RESET, 0);
-                if (rc < 0) { 
+                if (rc < 0) {
                     perror("Error in ioctl");
                     close(fd);
                     return -1;
@@ -548,52 +670,232 @@ int find_usb_device(unsigned int vendor_id, unsigned int product_id)
     return -1; // Device not found
 }
 
+int setSampleRate( double rate )
+{
+    unsigned char samprate[] = { 0x09, 0x00, 0xB8, 0x00, 0x00, 0x20, 0xA1, 0x07, 0x00 };
+    unsigned char response[64];
+
+    uint32_t _sample_rate, u32_rate = rate;
+    samprate[sizeof(samprate)-4] = u32_rate >>  0;
+    samprate[sizeof(samprate)-3] = u32_rate >>  8;
+    samprate[sizeof(samprate)-2] = u32_rate >> 16;
+    samprate[sizeof(samprate)-1] = u32_rate >> 24;
+
+    if ( _running ) {
+        _keep_running = true;
+        stop();
+    }
+
+    if ( ! transaction( samprate, sizeof(samprate), response ) )
+        perror("set_sample_rate failed\n");
+
+    if ( _running ) {
+        start();
+    }
+
+    u32_rate = 0;
+    u32_rate |= response[sizeof(samprate)-4] <<  0;
+    u32_rate |= response[sizeof(samprate)-3] <<  8;
+    u32_rate |= response[sizeof(samprate)-2] << 16;
+    u32_rate |= response[sizeof(samprate)-1] << 24;
+
+    _sample_rate = u32_rate;
+
+    if ( rate != _sample_rate ) {
+        t_print("Radio reported a sample rate of %d Hz\n", _sample_rate);
+        _sample_rate = 0;
+    }
+
+    return _sample_rate;
+}
+
 int initSDR()
 {
     int ret;
-    unsigned int vid, pid;
     unsigned char response[64];
+    struct sockaddr_in sdr_addr, host_sa;
+    struct timeval timeout;
+    int sockoptval = 1;
+    char* sdrip = mcb.ip;
 
-    if ((ret = find_usb_device(0x0403, 0xf728)) == 1) { // sdr-14
+    if (strlen(mcb.ip) != 0) {
+        if ((_tcp = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            t_print("\n Socket creation error \n");
+            return -1;
+        }
+
+        setsockopt(_tcp, SOL_SOCKET, SO_REUSEADDR, &sockoptval, sizeof(int));
+        setsockopt(_tcp, IPPROTO_TCP, TCP_NODELAY, &sockoptval, sizeof(int));
+        timeout.tv_usec = 500000;
+        timeout.tv_sec =  0;
+        setsockopt(_tcp, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        // don't wait when shutting down
+        struct linger lngr;
+        lngr.l_onoff  = 1;
+        lngr.l_linger = 0;
+        setsockopt(_tcp, SOL_SOCKET, SO_LINGER, &lngr, sizeof(struct linger));
+
+#if 1
+        sdr_addr.sin_family = AF_INET;
+        sdr_addr.sin_port = htons(PORT);
+
+        // Convert IPv4 and IPv6 addresses from text to binary form
+        if (inet_pton(AF_INET, sdrip, &sdr_addr.sin_addr) <= 0) {
+            t_print( "\nInvalid address/ Address not supported \n");
+            return -1;
+        }
+
+        if ((ret = connect(_tcp, (struct sockaddr*)&sdr_addr, sizeof(sdr_addr))) < 0) {
+            close(_tcp);
+            _tcp = 0;
+            t_print("SDR-IP Not Found, ensure you specified IP using option '-i'\n\n");
+        }
+#else
+    //char host[] = DEFAULT_HOST;
+    char host[] = "192.168.1.14";
+    struct hostent *hp;         /* host information */
+    struct sockaddr_in host_sa; /* local address */
+    struct sockaddr_in peer_sa; /* remote address */
+
+    /* look up the address of the server given its name */
+    hp = gethostbyname( host );
+    if (!hp) {
+      close(_tcp);
+      printf("NO HOST\n");
+    }    
+
+    /* fill in the hosts's address and data */
+    memset(&host_sa, 0, sizeof(host_sa));
+    host_sa.sin_family = AF_INET;
+    host_sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    host_sa.sin_port = htons(0);
+
+    if ( bind(_tcp, (struct sockaddr *)&host_sa, sizeof(host_sa)) < 0 )
+    {    
+      close(_tcp);
+      printf("Bind of TCP socket failed\n");
+    }    
+
+    /* fill in the server's address and data */
+    memset(&peer_sa, 0, sizeof(peer_sa));
+    peer_sa.sin_family = AF_INET;
+    peer_sa.sin_port = htons(PORT);
+
+    /* put the host's address into the server address structure */
+    memcpy((void *)&peer_sa.sin_addr, hp->h_addr_list[0], hp->h_length);
+
+    /* connect to server */
+    if ( connect(_tcp, (struct sockaddr *)&peer_sa, sizeof(peer_sa)) < 0 )
+    {    
+      close(_tcp);
+      printf("Cant CONNECT\n");
+    }
+    sleep(10000);
+#endif
+    }
+
+    usleep(10000);
+    unsigned char name[] = { 0x04, 0x20, 0x01, 0x00 };
+
+    if (_tcp != 0) {
+        oldnew = 1; // set to 2 for protocol2
+
+        transaction( name, sizeof(name), response );
+
+        if ( (_udp = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
+            close(_tcp);
+            t_perror("Could not create UDP socket\n");
+        }
+
+        sockoptval = 1;
+        setsockopt(_udp, SOL_SOCKET, SO_REUSEADDR, &sockoptval, sizeof(int));
+
+        // fill in the hosts's address and data
+        memset(&host_sa, 0, sizeof(host_sa));
+        host_sa.sin_family = AF_INET;
+        host_sa.sin_addr.s_addr = htonl(INADDR_ANY);
+        host_sa.sin_port = htons(PORT);
+
+        if ( bind(_udp, (struct sockaddr *)&host_sa, sizeof(host_sa)) < 0 ) {
+            close(_tcp);
+            close(_udp);
+            perror("Bind of UDP socket failed\n");
+        }
+    } else if ((ret = find_usb_device(0x0403, 0xf728)) == 1) { // sdr-14
         vid = 0x0403;
         pid = 0xf728;
+        oldnew = 1;
     } else if ((ret = find_usb_device(0x1234, 0x0009)) == 1) { // sdr-iq
         vid = 0x1234;
         pid = 0x0009;
+        oldnew = 1;
     } else
         return -1;
 
-    if ((ftdi = ftdi_new()) == 0) {
-        t_print("ftdi_new failed\n");
-        return -1;
+    if (!_tcp) {
+        if ((ftdi = ftdi_new()) == 0) {
+            t_print("ftdi_new failed\n");
+            return -1;
+        }
+
+        if ((ret = ftdi_usb_open(ftdi, vid, pid)) < 0) {
+            t_print("unable to open ftdi device: %d (%s)\n", ret, ftdi_get_error_string(ftdi));
+            ftdi_free(ftdi);
+            return -1;
+        }
+
+        _run_usb_read_task = true;
+        if ((ret = pthread_create (&usb_read_task, NULL, usb_read_task_func, NULL))) {
+            t_print ("pthread_create failed on usb_read_task: ret=%d\n", ret);
+            return -1;
+        }
+        pthread_detach(usb_read_task);
+
+        transaction( name, sizeof(name), response );
+
+        if (SetBandwidth(190000) != 1) {
+            t_print("Unable to set the SDR Bandwidth\n");
+            return -1;
+        }
+        mcb.q = resamp_crcf_create(0.979202154f,13,0.45f,60.0f,64);
+
+    } else {
+        _run_tcp_keepalive_task = true;
+        if ((ret = pthread_create (&tcp_keepalive_task, NULL, tcp_keepalive_task_func, NULL))) {
+            t_print ("pthread_create failed on tcp_keepalive_task: ret=%d\n", ret);
+            return -1;
+        }
+        pthread_detach(tcp_keepalive_task);
+
+        _run_udp_read_task = true;
+        if ((ret = pthread_create (&udp_read_task, NULL, udp_read_task_func, NULL))) {
+            t_print ("pthread_create failed on tcp_keepalive_task: ret=%d\n", ret);
+            return -1;
+        }
+        pthread_detach(udp_read_task);
+
+        if ((ret = setSampleRate(195121)) == 0) {
+            t_print("Unable to set the SDR SampleRate\n");
+            return -1;
+        }
+
+        mcb.q = resamp_crcf_create(0.984004797f,13,0.45f,60.0f,64);
     }
 
-    if ((ret = ftdi_usb_open(ftdi, vid, pid)) < 0) {
-        t_print("unable to open ftdi device: %d (%s)\n", ret, ftdi_get_error_string(ftdi));
-        ftdi_free(ftdi);
-        return -1;
-    }
+    resamp_crcf_print(mcb.q);
 
-    _run_usb_read_task = true;
-    if ((ret = pthread_create (&usb_read_task, NULL, usb_read_task_func, NULL))) {
-        t_print ("pthread_create failed on usb_read_task: ret=%d\n", ret);
-        return (-1);
-    }
-    pthread_detach(usb_read_task);
-
-    unsigned char name[] = { 0x04, 0x20, 0x01, 0x00 }; // SDR14 4.1.1 Target Name
     if ( transaction( name, sizeof(name), response ) )
         t_print("Using RFSPACE %s ", &response[sizeof(name)]);
 
     unsigned char sern[] = { 0x04, 0x20, 0x02, 0x00 }; // SDR14 4.1.2 Target Serial Number
     if ( transaction( sern, sizeof(sern), response ) )
-        printf("SN %s\n", &response[sizeof(sern)]);
+        printf("SN %s", &response[sizeof(sern)]);
 
-    // Set the SDR bandwidth
-    if (SetBandwidth(190000) != 1) {
-        t_print("Unable to set the SDR Bandwidth\n");
-        return -1;
-    }
+    if (strlen(mcb.ip) != 0)
+        printf(" IP %s\n", mcb.ip);
+    else
+        printf("\n");
 
     // Set the SDR frequency
     if (setFrequency(900000) != 1) {
@@ -602,14 +904,10 @@ int initSDR()
     }
 
     // Set the SDR RF gain
-    if (SetRFGain(10) != 1) {
+    if (SetRFGain((vid)?10:0) != 1) {
         t_print("Unable to set the SDR RF Gain\n");
         return -1;
     }
-
-    // default to 190000
-    mcb.q = resamp_crcf_create(0.979202154f,13,0.45f,60.0f,64);
-    resamp_crcf_print(mcb.q);
 
     return 1;
 }
@@ -690,7 +988,7 @@ load_packet (struct rcvr_cb *rcb)
 void *
 hpsdrsim_sendiq_thr_func (void *arg)
 {
-    int samps_packet;
+    int samps_packet, num_samps = (vid)?(SDR_READ_COUNT / 4):256;
     struct rcvr_cb *rcb = (struct rcvr_cb *) arg;
 
     rcb->iqSample_offset = rcb->iqSamples_remaining = 0;
@@ -715,7 +1013,7 @@ hpsdrsim_sendiq_thr_func (void *arg)
 
         // resample starting at any remaining offset
         unsigned int ny;
-        resamp_crcf_execute_block(mcb.q, &iqBuffer[0], (RTL_READ_COUNT / 4), &rcb->iqSamples[rcb->iqSamples_remaining], &ny);
+        resamp_crcf_execute_block(mcb.q, &iqBuffer[0], num_samps, &rcb->iqSamples[rcb->iqSamples_remaining], &ny);
         rcb->iqSamples_remaining += ny;
 
         while (rcb->iqSamples_remaining > samps_packet) {
@@ -780,10 +1078,12 @@ format_payload (void)
         payload[i] = proto_header[i - 520];
 }
 
+#if 0
 int new_protocol_running()
 {
     return 0;
 }
+#endif
 
 int main (int argc, char *argv[])
 {
@@ -809,10 +1109,29 @@ int main (int argc, char *argv[])
     const int MAC6N = 0xDD; // P2
     int OLDDEVICE = ODEV_HERMES;
     int NEWDEVICE = NDEV_HERMES;
+    int CmdOption;
 
     struct sigaction sigact;
 
     mcb.output_rate = 50000;
+    mcb.ip[0] = '\0';
+
+    while((CmdOption = getopt(argc, argv, ":i:h")) != -1) {
+        switch(CmdOption) {
+        case 'h':
+            printf("Usage: %s <optional arguments>\n", basename(argv[0]));
+            printf("optional arguments:\n");
+            printf("-h help (prints this usage)\n");
+            printf("-i IP Address for SDR-IP\n");
+            return EXIT_SUCCESS;
+            break;
+
+        case 'i':
+            strcpy (mcb.ip, optarg);
+            break;
+        }
+    }
+    printf("\n");
 
     // Initialize per receiver config settings
     for (i = 0; i < MAX_RCVRS; i++) {
@@ -825,7 +1144,7 @@ int main (int argc, char *argv[])
         copy_rcvr[i] = -1;
     }
 
-    sigact.sa_handler = sdr14_sighandler;
+    sigact.sa_handler = sdr_sighandler;
     sigemptyset (&sigact.sa_mask);
     sigact.sa_flags = 0;
     sigaction (SIGINT, &sigact, NULL);
@@ -1094,7 +1413,7 @@ int main (int argc, char *argv[])
                 addr_new.sin_family = AF_INET;
                 addr_new.sin_addr.s_addr = addr_from.sin_addr.s_addr;
                 addr_new.sin_port = addr_from.sin_port;
-                //new_protocol_general_packet(buffer);
+                new_protocol_general_packet(buffer);
                 break;
             } else {
                 t_print("Invalid packet (len=%d) detected: ", bytes_read);
@@ -1123,11 +1442,13 @@ void process_ep2(uint8_t *frame)
     static int last_rfgain = 0;
     u_char C0_1, C0_2;
 
+#if 1
     // this is really attenuation
     if ((frame[1] == 0x40) && (last_rfgain != (frame[4] & 0x1F))) {
         SetRFGain(-1 * (frame[4] & 0x1F));
         last_rfgain = frame[4] & 0x1F;
     }
+#endif
 
 #if 0
     for (i = 0; i < HPSDR_FRAME_LEN; i++) {
@@ -1179,36 +1500,67 @@ void process_ep2(uint8_t *frame)
                     stop();
                 }
                 usleep(200000);
-                resamp_crcf_destroy(mcb.q);
                 last_rate = (buffer[12 + offset] & 3);
+                resamp_crcf_destroy(mcb.q);
 
-                switch (last_rate) {
-                case 3:
-                    mcb.q = resamp_crcf_create(1.958404308f,13,0.45f,60.0f,64);
-                    mcb.output_rate = 190000;
-                    break;
+                if (vid) {
+                    switch (last_rate) {
+                    case 3:
+                        mcb.q = resamp_crcf_create(1.958404308f,13,0.45f,60.0f,64);
+                        mcb.output_rate = 190000;
+                        break;
 
-                case 2:
-                    mcb.q = resamp_crcf_create(0.979202154f,13,0.45f,60.0f,64);
-                    mcb.output_rate = 190000;
-                    break;
+                    case 2:
+                        mcb.q = resamp_crcf_create(0.979202154f,13,0.45f,60.0f,64);
+                        mcb.output_rate = 190000;
+                        break;
 
-                case 1:
-                    mcb.q = resamp_crcf_create(0.864000864f,13,0.45f,60.0f,64);
-                    mcb.output_rate = 100000;
-                    break;
+                    case 1:
+                        mcb.q = resamp_crcf_create(0.864000864f,13,0.45f,60.0f,64);
+                        mcb.output_rate = 100000;
+                        break;
 
-                case 0:
-                    mcb.q = resamp_crcf_create(0.864000864f,13,0.45f,60.0f,64);
-                    mcb.output_rate = 50000;
-                    break;
+                    case 0:
+                        mcb.q = resamp_crcf_create(0.864000864f,13,0.45f,60.0f,64);
+                        mcb.output_rate = 50000;
+                        break;
 
-                default:
-                    t_print ("WARNING: UNSUPPORTED RATE: %x!!!\n",
-                             last_rate);
+                    default:
+                        t_print ("WARNING: UNSUPPORTED RATE: %x!!!\n",
+                                 last_rate);
+                    }
+
+                    SetBandwidth(mcb.output_rate);
+                } else {
+                    switch (last_rate) {
+                    case 3:
+                        mcb.output_rate = 380952;
+                        mcb.q = resamp_crcf_create(1.008001008,13,0.45f,60.0f,64);
+                        break;
+
+                    case 2:
+                        mcb.output_rate = 195121;
+                        mcb.q = resamp_crcf_create(0.984004797f,13,0.45f,60.0f,64);
+                        break;
+
+                    case 1:
+                        mcb.output_rate = 96385;
+                        mcb.q = resamp_crcf_create(0.996005603f,13,0.45f,60.0f,64);
+                        break;
+
+                    case 0:
+                        mcb.output_rate = 48192;
+                        mcb.q = resamp_crcf_create(0.996015936f,13,0.45f,60.0f,64);
+                        break;
+
+                    default:
+                        t_print ("WARNING: UNSUPPORTED RATE: %x!!!\n",
+                                 last_rate);
+                    }
+
+                    setSampleRate(mcb.output_rate);
                 }
-
-                SetBandwidth(mcb.output_rate);
+                resamp_crcf_print(mcb.q);
 
                 if ( _running ) {
                     start();
@@ -1281,16 +1633,15 @@ void *handler_ep6(void *arg)
         }
 
 #if 0                           // dump the frame for analysis
-        if (iloop++ == 100) {
-            //iloop = 0;
+        if (counter == 100) {
             t_print ("rcvrs_mask:%x send_flags:%d\n", mcb.rcvrs_mask,
                      send_flags);
 
             for (int i = 0; i < HPSDR_FRAME_LEN; i++) {
-                t_print ("%4d:%2x ", i, payload[i]);
+                printf("%4d:%2x ", i, payload[i]);
 
                 if (!((i + 1) % 8))
-                    t_print ("\n");
+                    printf("\n");
             }
         }
 

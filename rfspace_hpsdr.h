@@ -1,10 +1,10 @@
-#ifndef _SDR14_HPSDR_H
-#define _SDR14_HPSDR_H
+#ifndef _RFSPACE_HPSDR_H
+#define _RFSPACE_HPSDR_H
 
 /* Copyright (C)
 *
 *   10/2025 - Rick Koch, N1GP
-*   Wrote rfspace_usb2hpsdr using various open sources on the internet.
+*   Wrote rfspace_hpsdr using various open sources on the internet.
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -46,6 +46,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <complex.h>
 #include <liquid/liquid.h>
 #include <linux/usbdevice_fs.h>
@@ -54,16 +55,14 @@
 #define PRG_VERSION "1.0" // see ChangeLog for history
 
 #define HERMES_FW_VER 32
-#define PORT 1024
 #define MAX_BUFFER_LEN 2048
 #define HPSDR_FRAME_LEN 1032
 #define IQ_FRAME_DATA_LEN 63
-#define RTL_BANDWIDTH 300000   // Tuner set to 400 Khz IF BW 
-#define DOWNSAMPLE_192 8    // downsample value used to get 192khz
-#define RTL_SAMPLE_RATE (192000 * DOWNSAMPLE_192)
-#define RTL_READ_COUNT (8192)
+#define SDR_READ_COUNT (8192)
 #define MAX_RCVRS 1
 #define IQ_FRAME_DATA_LEN 63
+#define PORT 50000
+#define DEFAULT_HOST "127.0.0.1"
 #define MAXSTR 128
 
 struct main_cb {
@@ -78,6 +77,7 @@ struct main_cb {
     char sound_dev[MAXSTR];
     char ip_addr[MAXSTR];
     char serialstr[MAXSTR];
+    char ip[MAXSTR];
     resamp_crcf q;
 
     // the last array member is used to remember last settings
@@ -109,7 +109,7 @@ struct main_cb {
 
         int iqSample_offset;
         int iqSamples_remaining;
-        float complex iqSamples[((RTL_READ_COUNT / 2) + (IQ_FRAME_DATA_LEN * 2))];
+        float complex iqSamples[((SDR_READ_COUNT / 2) + (IQ_FRAME_DATA_LEN * 2))];
     } rcb[MAX_RCVRS];
 };
 
@@ -127,6 +127,14 @@ void hpsdrsim_stop_threads();
 #define NDEV_NONE          999
 #define NDEV_HERMES          1
 #define NDEV_ORION           4
+
+//##################### NEW PROTOCOL STUFF
+#define LENNOISE 1536000
+#define NOISEDIV (RAND_MAX / 768000)
+#define OLDRTXLEN 64512
+#define NEWRTXLEN 64320
+#define IM3a  0.60
+#define IM3b  0.20
 
 //
 // Forward declarations for new protocol stuff
@@ -146,4 +154,4 @@ extern int clock_nanosleep(clockid_t __clock_id, int __flags,
 void t_print(const char *format, ...);
 void t_perror(const char *string);
 
-#endif // _SDR14_HPSDR_H
+#endif // _RFSPACE_HPSDR_H

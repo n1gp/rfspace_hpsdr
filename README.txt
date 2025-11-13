@@ -1,6 +1,6 @@
 rfspace_usb2hpsdr is an RFSPACE USB SDR to HPSDR software translation server.
 
-It currently builds and runs on Linux.
+It currently builds and runs on Linux, and supports the SDR-IP and SDR-14.
 
 A real HPSDR radio's (i.e. Hermes) frequency range is from 10KHz to 55MHz.
 But the SDR-14 and SDR-IQ are only up to 30MHz.
@@ -25,7 +25,7 @@ These are two very useful OpenHPSDR programs:
 https://github.com/ramdor/Thetis
 https://github.com/dl1ycf/pihpsdr    
 
-I have tested this only on both Thetis and PiHPSDR using
+I have tested this on both Thetis and PiHPSDR using and SDR-IP and
 an SDR-14. The SDR-IQ support is currently untested.
 
 Useful documentation:

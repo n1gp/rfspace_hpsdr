@@ -6,9 +6,9 @@ LIBS = -lrt -lm -lpthread -lftdi1 -lliquid
 
 INCLUDES = -I/usr/local/include
 
-TARGET = rfspace_usb2hpsdr
+TARGET = rfspace_hpsdr
 
-SRCS = rfspace_usb2hpsdr.c
+SRCS = rfspace_hpsdr.c #protocol2.c
 
 OBJS = $(SRCS:.c=.o)
 
