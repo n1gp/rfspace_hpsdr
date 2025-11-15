@@ -115,7 +115,13 @@ struct main_cb {
 
 void format_payload(void);
 void load_packet(struct rcvr_cb* rcb);
+void load_packet2(struct rcvr_cb* rcb);
 void sdr14_sighandler(int signum);
+bool start(void);
+bool stop(void);
+int setFrequency(const double frequency);
+int setSampleRate( double rate );
+int SetRFGain( const double gain );
 
 void* hpsdrsim_sendiq_thr_func(void* arg);
 void hpsdrsim_stop_threads();

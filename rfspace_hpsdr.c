@@ -47,7 +47,8 @@ int _udp, _tcp;
 uint32_t last_sequence_number = 0;
 uint32_t last_seqnum = 0, seqnum;
 unsigned int vid = 0, pid = 0;
-int (*math_operation)(int, int);
+bool _running, _keep_running;
+struct main_cb mcb;
 float complex iqBuffer[((SDR_READ_COUNT / 2) + (IQ_FRAME_DATA_LEN * 2))];
 
 static int num_copy_rcvrs = 0, do_exit = 0;
@@ -55,21 +56,13 @@ static int copy_rcvr[8];
 static u_char last_num_rcvrs = 0;
 static u_char last_rate = 0;
 static int last_freq[8] = { 0 };
-static bool _running, _keep_running;
 
 static size_t resp_size;
 static unsigned char resp_data[1024*10];
 static pthread_mutex_t resp_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t resp_cond = PTHREAD_COND_INITIALIZER;
 
-struct sockaddr_in myaddr;				// our address
-struct sockaddr_in remaddr;				// remote address
-socklen_t addrlen = sizeof(remaddr);	// length of addresses
-
 #define SYNC 0x7F
-unsigned char hpsdrdata[1032];
-uint8_t header_hpsdrdata[4] = { 0xef, 0xfe, 1, 6 };
-uint8_t sync_hpsdrdata[8] = { SYNC, SYNC, SYNC, 0, 0, 0, 0, 0};
 static int sock_udp;
 
 static void process_ep2(uint8_t *frame);
@@ -82,16 +75,17 @@ static bool _run_usb_read_task = false;
 static bool _run_tcp_keepalive_task = false;
 static bool _run_udp_read_task = false;
 
-struct main_cb mcb;
-
 static pthread_mutex_t iqready_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t iqready_cond = PTHREAD_COND_INITIALIZER;
 static u_int rcvr_flags = 0;
-static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t send_cond = PTHREAD_COND_INITIALIZER;
-static u_int send_flags = 0;
-static pthread_mutex_t done_send_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t done_send_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t done_send_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t done_send_cond = PTHREAD_COND_INITIALIZER;
+u_int send_flags = 0;
+pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t send_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t liquid_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t liquid_cond = PTHREAD_COND_INITIALIZER;
+bool liquid_busy = false;
 
 static pthread_t hpsdrsim_sendiq_thr[MAX_RCVRS];
 static pthread_t usb_read_task;
@@ -109,19 +103,6 @@ static u_char payload[HPSDR_FRAME_LEN];
 
 struct sockaddr_in addr_new;
 static struct sockaddr_in addr_old;
-
-// PROTO2 =======
-static int run = 0;
-
-int new_protocol_running() {
-  if (run) { return 1; } 
-  else { return 0; } 
-}
-
-void new_protocol_general_packet(unsigned char *buffer) {
-  // STUB
-}
-// ==============
 
 // using clock_nanosleep of librt
 extern int clock_nanosleep(clockid_t __clock_id, int __flags,
@@ -284,7 +265,7 @@ void sdr_sighandler (int signum)
     do_exit = 1;
     if (_running) _running = false;
     if (running) running = 0;
-    hpsdrsim_stop_threads ();
+    //hpsdrsim_stop_threads ();
     resamp_crcf_destroy(mcb.q);
 }
 
@@ -430,6 +411,10 @@ int setFrequency(const double frequency)
     tune[sizeof(tune)-1] = 0;
 
     resp_transaction( tune, sizeof(tune) );
+    if (_tcp) {
+        tune[sizeof(tune)-6] = 1;
+        resp_transaction( tune, sizeof(tune) );
+    }
     return 1;
 }
 
@@ -483,10 +468,10 @@ void *udp_read_task_func (void *arg)
     struct sockaddr_in sa_in;           // remote address
     socklen_t addrlen = sizeof(sa_in);  // length of addresses
     ssize_t rx_bytes;
-    float scale = 80.0f;
+    float scale = 100.0f;
     unsigned char data[1024*2];
 
-    //t_print("Starting udp_read_task_func()\n");
+    t_print("Starting udp_read_task_func()\n");
     while ( _run_udp_read_task ) {
         rx_bytes = recvfrom(_udp, data, sizeof(data), 0, (struct sockaddr *)&sa_in, &addrlen);
         if ( rx_bytes <= 0 ) {
@@ -500,13 +485,11 @@ void *udp_read_task_func (void *arg)
         for ( size_t i = 0; i < num_samples; i++ ) {
             iqBuffer[i] = ((float)*(sample+0) * scale) + (((float)*(sample+1) * scale) * _Complex_I);
             //printf("i:%ld I:%x Q:%x ", i, *(sample+0), *(sample+1));
-            // offset to the next I+Q sample
             sample += 2;
         }
 
         pthread_mutex_lock (&iqready_lock);
-        rcvr_flags |= 1;
-        //rcvr_flags |= rcb->rcvr_mask;
+        rcvr_flags |= 1 << (mcb.active_num_rcvrs - 1);
         pthread_cond_broadcast (&iqready_cond);
         pthread_mutex_unlock (&iqready_lock);
     }
@@ -516,7 +499,7 @@ void *udp_read_task_func (void *arg)
 void *usb_read_task_func (void *arg)
 {
     unsigned char data[1024*10];
-    uint64_t time_us, last_time_us;
+    uint64_t time_us, last_time_us = 0;
     float scale = 20.0f;
 
     t_print("Starting usb_read_task_func()\n");
@@ -566,14 +549,9 @@ void *usb_read_task_func (void *arg)
                 // offset to the next I+Q sample
                 sample += 2;
             }
-#if 0
-            for ( size_t i = num_samples; i < num_samples+13; i++ ) {
-                iqBuffer[i] = 0.0f + (0.0f * _Complex_I);
-            }
-#endif
+
             pthread_mutex_lock (&iqready_lock);
-            rcvr_flags |= 1;
-            //rcvr_flags |= rcb->rcvr_mask;
+            rcvr_flags |= 1 << (mcb.active_num_rcvrs - 1);
             pthread_cond_broadcast (&iqready_cond);
             pthread_mutex_unlock (&iqready_lock);
         } else {
@@ -736,7 +714,6 @@ int initSDR()
         lngr.l_linger = 0;
         setsockopt(_tcp, SOL_SOCKET, SO_LINGER, &lngr, sizeof(struct linger));
 
-#if 1
         sdr_addr.sin_family = AF_INET;
         sdr_addr.sin_port = htons(PORT);
 
@@ -751,55 +728,13 @@ int initSDR()
             _tcp = 0;
             t_print("SDR-IP Not Found, ensure you specified IP using option '-i'\n\n");
         }
-#else
-    //char host[] = DEFAULT_HOST;
-    char host[] = "192.168.1.14";
-    struct hostent *hp;         /* host information */
-    struct sockaddr_in host_sa; /* local address */
-    struct sockaddr_in peer_sa; /* remote address */
-
-    /* look up the address of the server given its name */
-    hp = gethostbyname( host );
-    if (!hp) {
-      close(_tcp);
-      printf("NO HOST\n");
-    }    
-
-    /* fill in the hosts's address and data */
-    memset(&host_sa, 0, sizeof(host_sa));
-    host_sa.sin_family = AF_INET;
-    host_sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    host_sa.sin_port = htons(0);
-
-    if ( bind(_tcp, (struct sockaddr *)&host_sa, sizeof(host_sa)) < 0 )
-    {    
-      close(_tcp);
-      printf("Bind of TCP socket failed\n");
-    }    
-
-    /* fill in the server's address and data */
-    memset(&peer_sa, 0, sizeof(peer_sa));
-    peer_sa.sin_family = AF_INET;
-    peer_sa.sin_port = htons(PORT);
-
-    /* put the host's address into the server address structure */
-    memcpy((void *)&peer_sa.sin_addr, hp->h_addr_list[0], hp->h_length);
-
-    /* connect to server */
-    if ( connect(_tcp, (struct sockaddr *)&peer_sa, sizeof(peer_sa)) < 0 )
-    {    
-      close(_tcp);
-      printf("Cant CONNECT\n");
-    }
-    sleep(10000);
-#endif
     }
 
     usleep(10000);
     unsigned char name[] = { 0x04, 0x20, 0x01, 0x00 };
 
     if (_tcp != 0) {
-        oldnew = 1; // set to 2 for protocol2
+        oldnew = 2; // set to 1 for protocol1
 
         transaction( name, sizeof(name), response );
 
@@ -875,12 +810,11 @@ int initSDR()
         }
         pthread_detach(udp_read_task);
 
-        if ((ret = setSampleRate(195121)) == 0) {
+        if ((ret = setSampleRate(200000)) == 0) {
             t_print("Unable to set the SDR SampleRate\n");
             return -1;
         }
-
-        mcb.q = resamp_crcf_create(0.984004797f,13,0.45f,60.0f,64);
+        mcb.q = resamp_crcf_create(0.96f,13,0.45f,60.0f,64);
     }
 
     resamp_crcf_print(mcb.q);
@@ -897,8 +831,26 @@ int initSDR()
     else
         printf("\n");
 
+    unsigned char bootver[] = { 0x05, 0x20, 0x04, 0x00, 0x00 };
+    if ( transaction( bootver, sizeof(bootver), response ) )
+        t_print("BOOT %d ", *((uint16_t *)&response[sizeof(bootver)]));
+
+    unsigned char firmver[] = { 0x05, 0x20, 0x04, 0x00, 0x01 };
+    if ( transaction( firmver, sizeof(firmver), response ) )
+        printf("FW %d ", *((uint16_t *)&response[sizeof(firmver)]));
+
+    if ( _tcp )
+    {
+        unsigned char hardver[] = { 0x05, 0x20, 0x04, 0x00, 0x02 };
+        if ( transaction( hardver, sizeof(hardver), response ) )
+            printf("HW %d\n", *((uint16_t *)&response[sizeof(hardver)]));
+
+        unsigned char adgain1p5[] = { 0x06, 0x00, 0x8A, 0x00, 0x00, 0x02, };
+        transaction( adgain1p5, sizeof(adgain1p5), response );
+    } else printf("\n");
+
     // Set the SDR frequency
-    if (setFrequency(900000) != 1) {
+    if (setFrequency(9000000) != 1) {
         t_print("Unable to set the SDR Bandwidth\n");
         return -1;
     }
@@ -989,16 +941,19 @@ void *
 hpsdrsim_sendiq_thr_func (void *arg)
 {
     int samps_packet, num_samps = (vid)?(SDR_READ_COUNT / 4):256;
+    unsigned int ny;
     struct rcvr_cb *rcb = (struct rcvr_cb *) arg;
 
     rcb->iqSample_offset = rcb->iqSamples_remaining = 0;
 
     //t_print("ENTERING hpsdrsim_sendiq_thr_func() rcvr %d...\n", rcb->rcvr_num+1);
     while (!do_exit) {
-        if (!running) rcb->iqSample_offset = rcb->iqSamples_remaining = 0;
-        samps_packet = (num_copy_rcvrs > 0)
+        if (oldnew == 1) {
+            if (!running) rcb->iqSample_offset = rcb->iqSamples_remaining = 0;
+            samps_packet = (num_copy_rcvrs > 0)
                        ? nsamps_packet[(mcb.active_num_rcvrs - 1) + num_copy_rcvrs]
                        : mcb.nsamps_packet;
+        } else samps_packet = 238;
 
         pthread_mutex_lock (&iqready_lock);
         while (!(rcvr_flags & rcb->rcvr_mask)) {
@@ -1012,12 +967,16 @@ hpsdrsim_sendiq_thr_func (void *arg)
             rcb->iqSamples_remaining = 0;
 
         // resample starting at any remaining offset
-        unsigned int ny;
+        pthread_mutex_lock (&liquid_lock);
+        liquid_busy = true;
         resamp_crcf_execute_block(mcb.q, &iqBuffer[0], num_samps, &rcb->iqSamples[rcb->iqSamples_remaining], &ny);
+        liquid_busy = false;
+        pthread_cond_broadcast (&liquid_cond);
+        pthread_mutex_unlock (&liquid_lock);
         rcb->iqSamples_remaining += ny;
 
         while (rcb->iqSamples_remaining > samps_packet) {
-            load_packet (rcb);
+            (oldnew == 1) ? load_packet(rcb) : load_packet2(rcb);
             rcb->iqSamples_remaining -= samps_packet;
             rcb->iqSample_offset += samps_packet;
         }
@@ -1032,7 +991,7 @@ hpsdrsim_sendiq_thr_func (void *arg)
     }
 
     pthread_exit (NULL);
-    t_print("EXITING hpsdrsim_sendiq_thr_func() rcvr_mask%d...\n", rcb->rcvr_mask);
+    //t_print("EXITING hpsdrsim_sendiq_thr_func() rcvr_mask%d...\n", rcb->rcvr_mask);
 }
 
 void
@@ -1078,13 +1037,6 @@ format_payload (void)
         payload[i] = proto_header[i - 520];
 }
 
-#if 0
-int new_protocol_running()
-{
-    return 0;
-}
-#endif
-
 int main (int argc, char *argv[])
 {
     int r, count = 0;
@@ -1115,6 +1067,7 @@ int main (int argc, char *argv[])
 
     mcb.output_rate = 50000;
     mcb.ip[0] = '\0';
+    //strcpy(mcb.ip, "192.168.1.14");
 
     while((CmdOption = getopt(argc, argv, ":i:h")) != -1) {
         switch(CmdOption) {
@@ -1442,13 +1395,11 @@ void process_ep2(uint8_t *frame)
     static int last_rfgain = 0;
     u_char C0_1, C0_2;
 
-#if 1
     // this is really attenuation
     if ((frame[1] == 0x40) && (last_rfgain != (frame[4] & 0x1F))) {
         SetRFGain(-1 * (frame[4] & 0x1F));
         last_rfgain = frame[4] & 0x1F;
     }
-#endif
 
 #if 0
     for (i = 0; i < HPSDR_FRAME_LEN; i++) {
@@ -1495,15 +1446,20 @@ void process_ep2(uint8_t *frame)
         if ((C0_1 == 0x00) || (C0_2 == 0x00)) {
             offset = (C0_1 == 0x00) ? 0 : 512;
             if (last_rate != (buffer[12 + offset] & 3)) {
-                if ( _running ) {
-                    _keep_running = true;
-                    stop();
-                }
-                usleep(200000);
                 last_rate = (buffer[12 + offset] & 3);
-                resamp_crcf_destroy(mcb.q);
 
                 if (vid) {
+                    if ( _running ) {
+                        _keep_running = true;
+                        stop();
+                    }
+
+                    pthread_mutex_lock (&liquid_lock);
+                    while (liquid_busy) {
+                        pthread_cond_wait (&liquid_cond, &liquid_lock);
+                    }
+                    resamp_crcf_destroy(mcb.q);
+
                     switch (last_rate) {
                     case 3:
                         mcb.q = resamp_crcf_create(1.958404308f,13,0.45f,60.0f,64);
@@ -1526,46 +1482,22 @@ void process_ep2(uint8_t *frame)
                         break;
 
                     default:
-                        t_print ("WARNING: UNSUPPORTED RATE: %x!!!\n",
-                                 last_rate);
+                        mcb.q = resamp_crcf_create(0.979202154f,13,0.45f,60.0f,64);
+                        mcb.output_rate = 190000;
+                        t_print ("WARNING: UNSUPPORTED RATE: %x!!!\n", last_rate);
                     }
 
                     SetBandwidth(mcb.output_rate);
-                } else {
-                    switch (last_rate) {
-                    case 3:
-                        mcb.output_rate = 380952;
-                        mcb.q = resamp_crcf_create(1.008001008,13,0.45f,60.0f,64);
-                        break;
+                    pthread_mutex_unlock (&liquid_lock);
+                    resamp_crcf_print(mcb.q);
 
-                    case 2:
-                        mcb.output_rate = 195121;
-                        mcb.q = resamp_crcf_create(0.984004797f,13,0.45f,60.0f,64);
-                        break;
-
-                    case 1:
-                        mcb.output_rate = 96385;
-                        mcb.q = resamp_crcf_create(0.996005603f,13,0.45f,60.0f,64);
-                        break;
-
-                    case 0:
-                        mcb.output_rate = 48192;
-                        mcb.q = resamp_crcf_create(0.996015936f,13,0.45f,60.0f,64);
-                        break;
-
-                    default:
-                        t_print ("WARNING: UNSUPPORTED RATE: %x!!!\n",
-                                 last_rate);
+                    if ( _running ) {
+                        start();
                     }
-
+                } else {
+                    mcb.output_rate = (1 << last_rate) * 48000 / 0.96;
                     setSampleRate(mcb.output_rate);
                 }
-                resamp_crcf_print(mcb.q);
-
-                if ( _running ) {
-                    start();
-                }
-
                 t_print ("Setting hpsdr output rate to %d hz\n", mcb.output_rate);
             }
 

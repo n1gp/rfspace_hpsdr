@@ -1,4 +1,4 @@
-rfspace_usb2hpsdr is an RFSPACE USB SDR to HPSDR software translation server.
+rfspace_hpsdr is an RFSPACE SDR to HPSDR software translation server.
 
 It currently builds and runs on Linux, and supports the SDR-IP and SDR-14.
 
@@ -13,7 +13,7 @@ Since the real HPSDR (i.e. Hermes) rcvr can do up to eight rcvr
 slices, there is a concept of 'COPY' rcvrs in this server. This
 would allow one to use HPSDR programs that expected more rcvrs
 than were attached. Currently if a program request more rcvrs
-than are actually attached the rfspace_usb2hpsdr server will make copies
+than are actually attached the rfspace_hpsdr server will make copies
 of the last 'real' rcvr. This allows one to only have one SDR device
 attached and run PowerSDR mRX or Thetis, which may expect up to four rcvr
 slices.
@@ -42,23 +42,35 @@ I'd appreciate keeping me updated, n1gp@hotmail.com
 
 2. Installation
 
-	$cd rfspace_usb2hpsdr
+	$ git clone https://github.com/n1gp/rfspace_hpsdr.git
+	$ cd rfspace_hpsdr
 	$ make
 
 3. Usage
 
-	$ ./rfspace_usb2hpsdr 
-	  0.000000 Starting usb_read_task_func()
-	  0.000795 Using RFSPACE SDR-14 SN ER000053
-	<liquid.resamp_crcf, rate=0.979202, m=13, as=60.000, fc=0.45, npfb=64>
-	  0.181959 Waiting on Discovery...
+	For SDR-IP (specify the IP address of the SDR-14)
+	$ ./rfspace_hpsdr -i 192.168.1.14
+
+		0.000000 Starting udp_read_task_func()
+		<liquid.resamp_crcf, rate=0.96, m=13, as=60.000, fc=0.45, npfb=64>
+		0.017238 Using RFSPACE SDR-IP SN LA000056 IP 192.168.1.14
+		0.018562 BOOT 109 FW 109 HW 100
+		0.032140 Waiting on Discovery...
+
+	For SDR-14
+	$ ./rfspace_hpsdr 
+
+		0.000000 Starting usb_read_task_func()
+		0.000795 Using RFSPACE SDR-14 SN ER000053
+		<liquid.resamp_crcf, rate=0.979202, m=13, as=60.000, fc=0.45, npfb=64>
+		0.181959 Waiting on Discovery...
 
 4. Known problems
 
 - I notice that when I first plug in the USB cable from my SDR-14
-  to the PC, the rfspace_usb2hpsdr program hangs at:
+  to the PC, the rfspace_hpsdr program hangs at:
      Starting usb_read_task_func()
 
-  If this occurs, either use CTRL-C and restart it, or CTRL-Z and kill
+  If this occurs, either use CTRL-C and restart it, or CTRL-Z then kill
   and retry the program.
 

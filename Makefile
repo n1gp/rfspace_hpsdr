@@ -1,14 +1,14 @@
 CC = gcc
 
-CFLAGS = -Wall #-g
+CFLAGS = -Wall -O3 #-ffast-math -funroll-loops -ftree-vectorize -march=armv8-a+fp+simd #-g
 
 LIBS = -lrt -lm -lpthread -lftdi1 -lliquid
 
-INCLUDES = -I/usr/local/include
+INCLUDES =
 
 TARGET = rfspace_hpsdr
 
-SRCS = rfspace_hpsdr.c #protocol2.c
+SRCS = rfspace_hpsdr.c protocol2.c
 
 OBJS = $(SRCS:.c=.o)
 
