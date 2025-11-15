@@ -48,7 +48,7 @@ I'd appreciate keeping me updated, n1gp@hotmail.com
 
 3. Usage
 
-	For SDR-IP (specify the IP address of the SDR-14)
+	For SDR-IP (specify the IP address of the SDR-IP)
 	$ ./rfspace_hpsdr -i 192.168.1.14
 
 		0.000000 Starting udp_read_task_func()
